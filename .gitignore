@@ -17,3 +17,5 @@ runs/
 outputs/
 # Claude internal
 .claude/
+# Astar Island observation data
+astar_island/data/
