@@ -47,7 +47,14 @@ def infer_full_map(
 
     posterior = state.posterior_mean.copy()  # [seeds, H, W, 6]
 
-    if cnn_model is not None:
+    if cnn_model is not None and lgbm_model is not None:
+        # Combined: CNN handles spatial patterns, LightGBM adds round-level context
+        # Final = 0.4 * (0.6*p_cnn + 0.4*p_lgbm) + 0.6 * posterior
+        posterior = _blend_combined(
+            state, cnn_model, lgbm_model, posterior,
+            total_blend=0.4, cnn_share=0.6,
+        )
+    elif cnn_model is not None:
         posterior = _blend_cnn(state, cnn_model, posterior, cnn_blend_weight)
     elif lgbm_model is not None:
         posterior = _blend_lgbm(state, lgbm_model, posterior, lgbm_blend_weight)
@@ -62,6 +69,73 @@ def infer_full_map(
         posterior[s, mtn_mask] = mtn_prior
 
     return floor_renorm(posterior, floor=prob_floor)
+
+
+def _blend_combined(
+    state: "RoundState",
+    cnn_model: Any,
+    lgbm_model: Any,
+    posterior: np.ndarray,
+    total_blend: float = 0.4,
+    cnn_share: float = 0.6,
+) -> np.ndarray:
+    """Blend CNN + LightGBM together with Bayesian posterior.
+
+    result = total_blend * (cnn_share*p_cnn + (1-cnn_share)*p_lgbm)
+           + (1 - total_blend) * posterior
+    """
+    from ..training.train_cnn import _build_cnn_sample
+    from ..map.features import build_feature_matrix
+
+    seeds = state.seeds_count
+    H, W = state.height, state.width
+    lgbm_share = 1.0 - cnn_share
+    blended = posterior.copy()
+
+    for s in range(seeds):
+        # CNN prediction
+        p_cnn = None
+        try:
+            x = _build_cnn_sample(
+                state.raw_grids[s],
+                state.empirical_counts[s],
+                state.observed_count[s],
+            )
+            p_cnn = cnn_model.predict_proba(x).astype(np.float64)
+            p_cnn = np.clip(p_cnn, 1e-7, 1.0)
+            p_cnn /= p_cnn.sum(axis=-1, keepdims=True)
+        except Exception:
+            pass
+
+        # LightGBM prediction
+        p_lgbm = None
+        try:
+            feat_matrix = build_feature_matrix(
+                state.raw_grids[s],
+                round_features=state.round_features(s),
+            )
+            raw_proba = lgbm_model.predict_proba(feat_matrix)
+            if raw_proba.shape[1] < 6:
+                full = np.full((H * W, 6), 0.005, dtype=np.float64)
+                for ci, cls in enumerate(lgbm_model.classes_):
+                    full[:, int(cls)] = raw_proba[:, ci]
+                raw_proba = floor_renorm(full, floor=0.005)
+            p_lgbm = raw_proba.reshape(H, W, 6).astype(np.float64)
+        except Exception:
+            pass
+
+        if p_cnn is not None and p_lgbm is not None:
+            p_ml = cnn_share * p_cnn + lgbm_share * p_lgbm
+        elif p_cnn is not None:
+            p_ml = p_cnn
+        elif p_lgbm is not None:
+            p_ml = p_lgbm
+        else:
+            continue
+
+        blended[s] = total_blend * p_ml + (1.0 - total_blend) * posterior[s]
+
+    return blended
 
 
 def _blend_cnn(

@@ -54,6 +54,7 @@ def _load_models(models_dir: Path) -> tuple:
 
     To force LightGBM: delete or rename astar_island/models/cnn.pt
     """
+    # Load CNN
     cnn_model = None
     try:
         from astar_island.training.train_cnn import load_cnn
@@ -61,23 +62,28 @@ def _load_models(models_dir: Path) -> tuple:
     except Exception as e:
         log.warning(f"Could not load CNN: {e}")
 
+    # Always try to load LightGBM too (used alongside CNN if both available)
     lgbm_model = None
-    if cnn_model is None:
-        # Only load LightGBM if CNN unavailable
-        for path, label in [
-            (models_dir / "lgbm_calibrated.pkl", "calibrated"),
-            (models_dir / "lgbm.pkl", "raw"),
-        ]:
-            if path.exists():
-                try:
-                    with open(path, "rb") as f:
-                        lgbm_model = pickle.load(f)
-                    log.info(f"Loaded LightGBM ({label}) from {path}")
-                    break
-                except Exception as e:
-                    log.warning(f"Failed to load LightGBM {label}: {e}")
+    for path, label in [
+        (models_dir / "lgbm_calibrated.pkl", "calibrated"),
+        (models_dir / "lgbm.pkl", "raw"),
+    ]:
+        if path.exists():
+            try:
+                with open(path, "rb") as f:
+                    lgbm_model = pickle.load(f)
+                log.info(f"Loaded LightGBM ({label}) from {path}")
+                break
+            except Exception as e:
+                log.warning(f"Failed to load LightGBM {label}: {e}")
 
-    if cnn_model is None and lgbm_model is None:
+    if cnn_model is not None and lgbm_model is not None:
+        log.info("Using CNN + LightGBM combined")
+    elif cnn_model is not None:
+        log.info("Using CNN only (no LightGBM found)")
+    elif lgbm_model is not None:
+        log.info("Using LightGBM only (no CNN found)")
+    else:
         log.info("No ML model found — using baseline posterior only")
 
     return cnn_model, lgbm_model
