@@ -1,0 +1,28 @@
+api:
+  base_url: "https://api.ainm.no"
+  simulate_rate: 5.0    # max requests per second
+  submit_rate: 2.0      # max requests per second
+
+query:
+  budget: 50
+  phase_a_queries_per_seed: 8   # Phase A: 8 fixed windows x 5 seeds = 40 queries
+  viewport_w: 15
+  viewport_h: 15
+
+model:
+  prob_floor: 0.005             # minimum probability per class before submit
+  lgbm_blend_weight: 0.4        # weight of LightGBM vs posterior (0.4 * lgbm + 0.6 * posterior)
+  prior_strength: 2.0           # alpha = prior_probs * prior_strength
+
+# Per-raw-code class prior distributions [empty, settlement, port, ruin, forest, mountain]
+# Derived from simulation mechanics docs and domain knowledge.
+# Sum does NOT need to be exactly 1.0 — normalised at load time.
+priors:
+  ocean_raw10:      [0.97, 0.005, 0.005, 0.005, 0.005, 0.005]
+  mountain_raw5:    [0.005, 0.005, 0.005, 0.005, 0.005, 0.97]
+  forest_raw4:      [0.10,  0.05,  0.02,  0.05,  0.72,  0.02]
+  settlement_raw1:  [0.05,  0.60,  0.10,  0.15,  0.05,  0.005]
+  port_raw2:        [0.005, 0.10,  0.75,  0.08,  0.05,  0.005]
+  ruin_raw3:        [0.10,  0.15,  0.05,  0.55,  0.10,  0.005]
+  empty_raw0:       [0.50,  0.15,  0.05,  0.10,  0.15,  0.005]
+  plains_raw11:     [0.45,  0.20,  0.05,  0.10,  0.15,  0.005]

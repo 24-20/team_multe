@@ -1,284 +1,166 @@
-"""Authenticated REST client for the Astar Island API.
+"""AstarClient — authenticated HTTP client for the Astar Island API.
 
-Handles:
-- Bearer token auth
-- Typed request/response models
-- Retry with exponential backoff on transient errors
-- Query budget enforcement (50 queries per round, shared across all seeds)
+Token: reads ASTAR_TOKEN environment variable (Bearer header).
+Rate limits: simulate ≤ 5 req/s, submit ≤ 2 req/s.
 """
-from __future__ import annotations
-
-import logging
+import os
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import requests
+from dotenv import load_dotenv
 
-BASE_URL = "https://api.ainm.no"
-logger = logging.getLogger(__name__)
-
-
-class QueryBudgetExhausted(Exception):
-    pass
+load_dotenv()
 
 
 class AstarAPIError(Exception):
-    def __init__(self, status_code: int, body: str):
+    def __init__(self, status_code: int, body: Any) -> None:
         self.status_code = status_code
         self.body = body
-        super().__init__(f"API error {status_code}: {body}")
+        super().__init__(f"HTTP {status_code}: {body}")
 
 
-@dataclass
-class Settlement:
-    x: int
-    y: int
-    has_port: bool
-    alive: bool
+class _TokenBucket:
+    """Simple token bucket for rate limiting."""
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "Settlement":
-        return cls(x=d["x"], y=d["y"], has_port=d["has_port"], alive=d["alive"])
+    def __init__(self, rate: float) -> None:
+        self._rate = rate          # tokens per second
+        self._tokens = rate
+        self._last = time.monotonic()
 
-
-@dataclass
-class InitialState:
-    """Initial world state for one seed before any simulation."""
-    grid: list[list[int]]        # [height][width] terrain codes
-    settlements: list[Settlement]
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "InitialState":
-        return cls(
-            grid=d["grid"],
-            settlements=[Settlement.from_dict(s) for s in d.get("settlements", [])],
-        )
-
-
-@dataclass
-class Round:
-    id: str
-    round_number: int
-    status: str
-    map_width: int
-    map_height: int
-    seeds_count: int
-    initial_states: list[InitialState]
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Round":
-        return cls(
-            id=d["id"],
-            round_number=d["round_number"],
-            status=d["status"],
-            map_width=d["map_width"],
-            map_height=d["map_height"],
-            seeds_count=d["seeds_count"],
-            initial_states=[InitialState.from_dict(s) for s in d.get("initial_states", [])],
-        )
-
-
-@dataclass
-class SimulatedSettlement:
-    """Settlement data returned after running the simulation."""
-    x: int
-    y: int
-    has_port: bool
-    alive: bool
-    population: int | None = None
-    food: int | None = None
-    wealth: int | None = None
-    defense: int | None = None
-    tech_level: int | None = None
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "SimulatedSettlement":
-        return cls(
-            x=d["x"],
-            y=d["y"],
-            has_port=d.get("has_port", False),
-            alive=d.get("alive", True),
-            population=d.get("population"),
-            food=d.get("food"),
-            wealth=d.get("wealth"),
-            defense=d.get("defense"),
-            tech_level=d.get("tech_level"),
-        )
-
-
-@dataclass
-class Viewport:
-    x: int
-    y: int
-    w: int
-    h: int
-
-
-@dataclass
-class SimulateResult:
-    """Result of a single simulation query."""
-    grid: list[list[int]]                    # [h][w] terrain codes after 50 years
-    settlements: list[SimulatedSettlement]   # settlements visible in the viewport
-    viewport: Viewport
-    seed_index: int
-    queries_used: int                        # budget consumed so far
-
-    @classmethod
-    def from_dict(cls, d: dict, seed_index: int, queries_used: int) -> "SimulateResult":
-        vp = d["viewport"]
-        return cls(
-            grid=d["grid"],
-            settlements=[SimulatedSettlement.from_dict(s) for s in d.get("settlements", [])],
-            viewport=Viewport(x=vp["x"], y=vp["y"], w=vp["w"], h=vp["h"]),
-            seed_index=seed_index,
-            queries_used=queries_used,
-        )
+    def consume(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last
+        self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
+        self._last = now
+        if self._tokens < 1.0:
+            sleep_for = (1.0 - self._tokens) / self._rate
+            time.sleep(sleep_for)
+            self._tokens = 0.0
+        else:
+            self._tokens -= 1.0
 
 
 class AstarClient:
-    """Authenticated client for the Astar Island API."""
+    """REST client for the Astar Island API.
 
-    def __init__(self, token: str, budget: int = 50, max_retries: int = 3):
-        self.session = requests.Session()
-        self.session.headers["Authorization"] = f"Bearer {token}"
-        self._budget_total = budget
-        self._budget_used = 0
-        self._max_retries = max_retries
+    Usage:
+        client = AstarClient()  # reads ASTAR_TOKEN from env
+        active = client.get_active_round()
+        detail = client.get_round_detail(active["id"])
+    """
 
-    @property
-    def budget_used(self) -> int:
-        return self._budget_used
+    def __init__(
+        self,
+        token: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        self._token = token or os.environ["ASTAR_TOKEN"]
+        base = (base_url or os.environ.get("BASE_URL", "https://api.ainm.no")).rstrip("/")
+        self._base = base + "/astar-island"
 
-    @property
-    def budget_remaining(self) -> int:
-        return self._budget_total - self._budget_used
+        self._session = requests.Session()
+        self._session.headers["Authorization"] = f"Bearer {self._token}"
+        self._session.headers["Content-Type"] = "application/json"
 
-    def _request(self, method: str, path: str, **kwargs) -> Any:
-        url = f"{BASE_URL}{path}"
-        for attempt in range(self._max_retries):
-            try:
-                resp = self.session.request(method, url, timeout=30, **kwargs)
-                if resp.status_code == 429:
-                    wait = 2 ** attempt
-                    logger.warning("Rate limited; retrying in %ds", wait)
-                    time.sleep(wait)
-                    continue
-                if resp.status_code >= 500:
-                    wait = 2 ** attempt
-                    logger.warning("Server error %d; retrying in %ds", resp.status_code, wait)
-                    time.sleep(wait)
-                    continue
-                if not resp.ok:
-                    raise AstarAPIError(resp.status_code, resp.text)
-                return resp.json()
-            except requests.RequestException as e:
-                if attempt == self._max_retries - 1:
-                    raise
-                wait = 2 ** attempt
-                logger.warning("Request failed (%s); retrying in %ds", e, wait)
-                time.sleep(wait)
-        raise AstarAPIError(0, "Max retries exceeded")
+        self._sim_bucket = _TokenBucket(rate=5.0)
+        self._sub_bucket = _TokenBucket(rate=2.0)
 
-    def get_rounds(self) -> list[dict]:
-        """Return all rounds (active, scoring, completed)."""
-        return self._request("GET", "/astar-island/rounds")
+    # ------------------------------------------------------------------
+    # Round discovery
+    # ------------------------------------------------------------------
 
-    def get_active_round_id(self) -> str | None:
-        """Return the ID of the currently active round, or None."""
-        rounds = self.get_rounds()
-        for r in rounds:
-            if r.get("status") == "active":
-                return r["id"]
-        return None
+    def list_rounds(self) -> list[dict]:
+        return self._get("/rounds")
 
-    def get_round_detail(self, round_id: str) -> Round:
-        """Fetch full round details including initial states for all seeds."""
-        data = self._request("GET", f"/astar-island/rounds/{round_id}")
-        round_obj = Round.from_dict(data)
-        logger.info(
-            "Round %d: %dx%d map, %d seeds, status=%s",
-            round_obj.round_number,
-            round_obj.map_width,
-            round_obj.map_height,
-            round_obj.seeds_count,
-            round_obj.status,
-        )
-        return round_obj
+    def get_active_round(self) -> dict:
+        rounds = self.list_rounds()
+        active = [r for r in rounds if r.get("status") == "active"]
+        if not active:
+            raise RuntimeError("No active round found")
+        return active[0]
+
+    def get_round_detail(self, round_id: str) -> dict:
+        return self._get(f"/rounds/{round_id}")
+
+    def get_budget(self) -> dict:
+        return self._get("/budget")
+
+    # ------------------------------------------------------------------
+    # Simulation
+    # ------------------------------------------------------------------
 
     def simulate(
         self,
         round_id: str,
         seed_index: int,
-        viewport_x: int,
-        viewport_y: int,
-        viewport_w: int,
-        viewport_h: int,
-    ) -> SimulateResult:
-        """Run one stochastic simulation and return viewport observations.
-
-        Consumes 1 query from the shared budget.
-        Raises QueryBudgetExhausted if no budget remains.
-        """
-        if self._budget_used >= self._budget_total:
-            raise QueryBudgetExhausted(
-                f"Query budget exhausted ({self._budget_used}/{self._budget_total})"
-            )
-
-        # Clamp viewport dimensions to allowed range
-        viewport_w = max(5, min(15, viewport_w))
-        viewport_h = max(5, min(15, viewport_h))
-
+        x: int,
+        y: int,
+        w: int = 15,
+        h: int = 15,
+    ) -> dict:
+        self._sim_bucket.consume()
         payload = {
             "round_id": round_id,
             "seed_index": seed_index,
-            "viewport_x": viewport_x,
-            "viewport_y": viewport_y,
-            "viewport_w": viewport_w,
-            "viewport_h": viewport_h,
+            "viewport_x": x,
+            "viewport_y": y,
+            "viewport_w": w,
+            "viewport_h": h,
         }
-        logger.info(
-            "Simulate seed=%d viewport=(%d,%d)+%dx%d [budget %d/%d]",
-            seed_index, viewport_x, viewport_y, viewport_w, viewport_h,
-            self._budget_used + 1, self._budget_total,
-        )
-        data = self._request("POST", "/astar-island/simulate", json=payload)
-        self._budget_used += 1
-        result = SimulateResult.from_dict(data, seed_index=seed_index, queries_used=self._budget_used)
-        return result
+        return self._post("/simulate", payload)
 
-    def submit(self, round_id: str, seed_index: int, prediction: list) -> dict:
-        """Submit a H×W×6 probability tensor for one seed.
+    # ------------------------------------------------------------------
+    # Submission
+    # ------------------------------------------------------------------
 
-        prediction: nested list [height][width][6], each row sums to 1.0
-        """
-        _validate_prediction(prediction)
+    def submit(
+        self,
+        round_id: str,
+        seed_index: int,
+        prediction: np.ndarray,
+    ) -> dict:
+        self._sub_bucket.consume()
         payload = {
             "round_id": round_id,
             "seed_index": seed_index,
-            "prediction": prediction,
+            "prediction": prediction.tolist(),
         }
-        logger.info("Submitting prediction for seed %d", seed_index)
-        return self._request("POST", "/astar-island/submit", json=payload)
+        return self._post("/submit", payload)
 
+    # ------------------------------------------------------------------
+    # History & analysis
+    # ------------------------------------------------------------------
 
-def _validate_prediction(prediction: list) -> None:
-    """Raise ValueError if the prediction tensor is malformed."""
-    import math
-    height = len(prediction)
-    if height == 0:
-        raise ValueError("Prediction is empty")
-    width = len(prediction[0])
-    for y, row in enumerate(prediction):
-        if len(row) != width:
-            raise ValueError(f"Row {y} has width {len(row)}, expected {width}")
-        for x, cell in enumerate(row):
-            if len(cell) != 6:
-                raise ValueError(f"Cell ({x},{y}) has {len(cell)} classes, expected 6")
-            total = sum(cell)
-            if not math.isclose(total, 1.0, abs_tol=1e-4):
-                raise ValueError(f"Cell ({x},{y}) sums to {total:.6f}, expected 1.0")
-            if any(v < 0 for v in cell):
-                raise ValueError(f"Cell ({x},{y}) has negative probability")
-            if any(v == 0.0 for v in cell):
-                raise ValueError(f"Cell ({x},{y}) has zero probability — use minimum floor 0.01")
+    def my_rounds(self) -> list[dict]:
+        return self._get("/my-rounds")
+
+    def my_predictions(self, round_id: str) -> list[dict]:
+        return self._get(f"/my-predictions/{round_id}")
+
+    def analysis(self, round_id: str, seed_index: int) -> dict:
+        return self._get(f"/analysis/{round_id}/{seed_index}")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get(self, path: str, timeout: int = 30) -> Any:
+        resp = self._session.get(self._base + path, timeout=timeout)
+        self._raise_for_status(resp)
+        return resp.json()
+
+    def _post(self, path: str, payload: dict, timeout: int = 120) -> Any:
+        resp = self._session.post(self._base + path, json=payload, timeout=timeout)
+        self._raise_for_status(resp)
+        return resp.json()
+
+    @staticmethod
+    def _raise_for_status(resp: requests.Response) -> None:
+        if not resp.ok:
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text
+            raise AstarAPIError(resp.status_code, body)
