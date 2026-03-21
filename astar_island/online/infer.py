@@ -1,14 +1,13 @@
 """Full-map inference.
 
-Baseline path (no ML model):
-    1. Start from state.posterior_mean (Bayesian blend of prior + observations)
-    2. Apply static constraints from raw_grids (ocean / mountain)
-    3. floor_renorm(floor=0.005)
+Model priority (first available wins):
+    1. CNN  (cnn.pt)  — spatial segmentation model, sees full 40x40 map
+    2. LightGBM (lgbm_calibrated.pkl / lgbm.pkl) — tabular cell-level model
+    3. Baseline — Bayesian posterior only (prior + query observations)
 
-LightGBM path (model available):
-    1. Build feature matrix for all cells
-    2. Blend: 0.4 * p_lgbm + 0.6 * posterior_mean
-    3. Static constraints + floor_renorm
+All paths end with:
+    - Static overrides from raw_grids (ocean / mountain cells)
+    - floor_renorm(floor=0.005)
 """
 from __future__ import annotations
 
@@ -31,8 +30,13 @@ def infer_full_map(
     lgbm_model: Any | None = None,
     lgbm_blend_weight: float = 0.4,
     prob_floor: float = 0.005,
+    cnn_model: Any | None = None,
+    cnn_blend_weight: float = 0.4,
 ) -> np.ndarray:
     """Infer prediction tensor for all seeds.
+
+    Model priority: CNN > LightGBM > baseline posterior.
+    If both cnn_model and lgbm_model are provided, CNN takes priority.
 
     Returns:
         np.ndarray[float64] of shape [seeds, H, W, 6], floor-renormed
@@ -43,7 +47,9 @@ def infer_full_map(
 
     posterior = state.posterior_mean.copy()  # [seeds, H, W, 6]
 
-    if lgbm_model is not None:
+    if cnn_model is not None:
+        posterior = _blend_cnn(state, cnn_model, posterior, cnn_blend_weight)
+    elif lgbm_model is not None:
         posterior = _blend_lgbm(state, lgbm_model, posterior, lgbm_blend_weight)
 
     # Apply static constraints from raw grids (NOT encoded — raw is authoritative)
@@ -56,6 +62,36 @@ def infer_full_map(
         posterior[s, mtn_mask] = mtn_prior
 
     return floor_renorm(posterior, floor=prob_floor)
+
+
+def _blend_cnn(
+    state: "RoundState",
+    cnn_model: Any,
+    posterior: np.ndarray,
+    blend_weight: float,
+) -> np.ndarray:
+    """Blend CNN predictions with Bayesian posterior."""
+    from ..training.train_cnn import _build_cnn_sample
+
+    seeds = state.seeds_count
+    blended = posterior.copy()
+
+    for s in range(seeds):
+        x = _build_cnn_sample(
+            state.raw_grids[s],
+            state.empirical_counts[s],
+            state.observed_count[s],
+        )  # [H, W, 13]
+        try:
+            p_cnn = cnn_model.predict_proba(x)  # [H, W, 6]
+        except Exception:
+            continue  # fall back to posterior-only if CNN fails
+
+        p_cnn = np.clip(p_cnn, 1e-7, 1.0).astype(np.float64)
+        p_cnn /= p_cnn.sum(axis=-1, keepdims=True)
+        blended[s] = blend_weight * p_cnn + (1.0 - blend_weight) * posterior[s]
+
+    return blended
 
 
 def _blend_lgbm(

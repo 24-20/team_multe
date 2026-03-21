@@ -44,23 +44,43 @@ from astar_island.utils.logging import get_logger
 log = get_logger("run_online_round")
 
 
-def _load_lgbm_model(models_dir: Path):
-    """Load calibrated model if available, otherwise raw model, else None."""
-    cal_path = models_dir / "lgbm_calibrated.pkl"
-    raw_path = models_dir / "lgbm.pkl"
+def _load_models(models_dir: Path) -> tuple:
+    """Load best available models. Returns (cnn_model, lgbm_model).
 
-    for path, label in [(cal_path, "calibrated"), (raw_path, "raw")]:
-        if path.exists():
-            try:
-                with open(path, "rb") as f:
-                    model = pickle.load(f)
-                log.info(f"Loaded LightGBM model ({label}) from {path}")
-                return model
-            except Exception as e:
-                log.warning(f"Failed to load {label} model from {path}: {e}")
+    Priority:
+        - CNN (cnn.pt) if available → used instead of LightGBM
+        - LightGBM (lgbm_calibrated.pkl / lgbm.pkl) as fallback
+        - Both can be None → baseline posterior only
 
-    log.info("No LightGBM model found — using baseline posterior only")
-    return None
+    To force LightGBM: delete or rename astar_island/models/cnn.pt
+    """
+    cnn_model = None
+    try:
+        from astar_island.training.train_cnn import load_cnn
+        cnn_model = load_cnn(models_dir)
+    except Exception as e:
+        log.warning(f"Could not load CNN: {e}")
+
+    lgbm_model = None
+    if cnn_model is None:
+        # Only load LightGBM if CNN unavailable
+        for path, label in [
+            (models_dir / "lgbm_calibrated.pkl", "calibrated"),
+            (models_dir / "lgbm.pkl", "raw"),
+        ]:
+            if path.exists():
+                try:
+                    with open(path, "rb") as f:
+                        lgbm_model = pickle.load(f)
+                    log.info(f"Loaded LightGBM ({label}) from {path}")
+                    break
+                except Exception as e:
+                    log.warning(f"Failed to load LightGBM {label}: {e}")
+
+    if cnn_model is None and lgbm_model is None:
+        log.info("No ML model found — using baseline posterior only")
+
+    return cnn_model, lgbm_model
 
 
 def _execute_queries(
@@ -132,7 +152,7 @@ def run(args: argparse.Namespace) -> None:
         models_dir = cwd / "astar_island" / "models"
 
     client = AstarClient()
-    lgbm_model = _load_lgbm_model(models_dir)
+    cnn_model, lgbm_model = _load_models(models_dir)
 
     # ── Get round ──────────────────────────────────────────────────────
     if args.round_id:
@@ -177,13 +197,13 @@ def run(args: argparse.Namespace) -> None:
 
     config_snapshot = {
         "mode": args.mode,
-        "lgbm": lgbm_model is not None,
+        "model": "cnn" if cnn_model is not None else ("lgbm" if lgbm_model is not None else "baseline"),
         "budget": 50,
     }
 
     # ── SUBMIT 1: Baseline (prior-only, no queries) ────────────────────
     log.info("Inferring baseline prediction (no queries)...")
-    pred = infer_full_map(state, lgbm_model=lgbm_model)
+    pred = infer_full_map(state, lgbm_model=lgbm_model, cnn_model=cnn_model)
     submit_all_seeds(
         client, round_id, pred, state, store,
         model_version="baseline_pre_queries",
@@ -200,7 +220,7 @@ def run(args: argparse.Namespace) -> None:
 
     # ── SUBMIT 2: After coverage ───────────────────────────────────────
     log.info("Inferring after coverage queries...")
-    pred = infer_full_map(state, lgbm_model=lgbm_model)
+    pred = infer_full_map(state, lgbm_model=lgbm_model, cnn_model=cnn_model)
     submit_all_seeds(
         client, round_id, pred, state, store,
         model_version="posterior_post_coverage",
@@ -219,7 +239,7 @@ def run(args: argparse.Namespace) -> None:
 
     # ── SUBMIT 3: Final ────────────────────────────────────────────────
     log.info("Final inference...")
-    pred = infer_full_map(state, lgbm_model=lgbm_model)
+    pred = infer_full_map(state, lgbm_model=lgbm_model, cnn_model=cnn_model)
     submit_all_seeds(
         client, round_id, pred, state, store,
         model_version="posterior_final",
